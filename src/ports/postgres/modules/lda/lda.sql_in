@@ -150,6 +150,14 @@ lda_train( data_table,
                 <th>model</th>
                 <td>BIGINT[]. The encoded model description (not human readable).</td>
             </tr>
+            <tr>
+                <th>perplexity</th>
+                <td>DOUBLE PRECISION[].  Array of perplexity values as per the 'evaluate_every' parameter. For example, if 'evaluate_every=5' this would be an array of perplexity values for every 5th iteration, plus the last iteration.</td>
+            </tr>
+            <tr>
+                <th>perplexity_iters</th>
+                <td>INTEGER[]. Array indicating the iterations for which perplexity is calculated, as derived from the parameters 'iter_num' and 'evaluate_every'.  For example, if 'iter_num=5' and 'evaluate_every=2', then 'perplexity_iters' value would be {2,4,5} indicating that perplexity is computed at iterations 2, 4 and 5 (at the end), unless of course it terminated earlier due to 'perplexity_tol'.  If 'iter_num=5' and 'evaluate_every=1', then 'perplexity_iters' value would be {1,2,3,4,5} indicating that perplexity is computed at every iteration, again assuming it ran the full number of iterations.</td>
+            </tr>
         </table>
     </dd>
     <dt>output_data_table</dt>
@@ -212,6 +220,10 @@ lda_train( data_table,
     <dt>beta</dt>
     <dd>DOUBLE PRECISION. Dirichlet prior for the per-topic
     word multinomial (e.g., 0.01 is a reasonable value to start with).</dd>
+    <dt>evaluate_every</dt>
+    <dd>int, optional (default=0). How often to evaluate perplexity. Set it to 0 or negative number to not evaluate perplexity in training at all. Evaluating perplexity can help you check convergence in training process, but it will also increase total training time. Evaluating perplexity in every iteration might increase training time up to two-fold.</dd>
+    <dt>perplexity_tol</dt>
+    <dd>float, optional (default=1e-1). Perplexity tolerance to stop iterating. Only used when evaluate_every is greater than 0.</dd>
 </dl>
 
 @anchor predict
@@ -961,13 +973,38 @@ MADLIB_SCHEMA.lda_train
     topic_num           INT4,
     iter_num            INT4,
     alpha               FLOAT8,
-    beta                FLOAT8
+    beta                FLOAT8 
 )
 RETURNS SETOF MADLIB_SCHEMA.lda_result AS $$
     PythonFunctionBodyOnly(`lda', `lda')
     with AOControl(False):
         lda.lda_train(schema_madlib, data_table, model_table, output_data_table,
-                      voc_size, topic_num, iter_num, alpha, beta)
+                      voc_size, topic_num, iter_num, alpha, beta, 0, 0.1)
+    return [[model_table, 'model table'],
+        [output_data_table, 'output data table']]
+$$ LANGUAGE plpythonu
+m4_ifdef(`__HAS_FUNCTION_PROPERTIES__', `MODIFIES SQL DATA', `');
+
+
+CREATE OR REPLACE FUNCTION
+MADLIB_SCHEMA.lda_train
+(
+    data_table          TEXT,
+    model_table         TEXT,
+    output_data_table   TEXT,
+    voc_size            INT4,
+    topic_num           INT4,
+    iter_num            INT4,
+    alpha               FLOAT8,
+    beta                FLOAT8, 
+    evaluate_every      INT4,
+    perplexity_tol      FLOAT8
+)
+RETURNS SETOF MADLIB_SCHEMA.lda_result AS $$
+    PythonFunctionBodyOnly(`lda', `lda')
+    with AOControl(False):
+        lda.lda_train(schema_madlib, data_table, model_table, output_data_table,
+                      voc_size, topic_num, iter_num, alpha, beta,evaluate_every , perplexity_tol)
     return [[model_table, 'model table'],
         [output_data_table, 'output data table']]
 $$ LANGUAGE plpythonu

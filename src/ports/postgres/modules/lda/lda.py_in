@@ -18,6 +18,7 @@ from utilities.control import HashaggControl
 from utilities.utilities import __mad_version, _assert, warn
 from utilities.validate_args import output_tbl_valid
 from utilities.validate_args import input_tbl_valid
+from utilities.utilities import py_list_to_sql_string
 
 # use mad_vec to process arrays passed as strings in GPDB < 4.1 and PG < 9.0
 version_wrapper = __mad_version()
@@ -33,7 +34,7 @@ class LDATrainer:
 
     def __init__(self, schema_madlib, data_table, model_table,
                  output_data_table, voc_size, topic_num,
-                 iter_num, alpha, beta):
+                 iter_num, alpha, beta, evaluate_every, perplexity_tol ):
         self.schema_madlib = schema_madlib
         self.data_table = data_table
         self.voc_size = voc_size
@@ -45,6 +46,11 @@ class LDATrainer:
         self.output_data_table = output_data_table
         self.work_table_0 = '__work_table_train_0__'
         self.work_table_1 = '__work_table_train_1__'
+        self.evaluate_every = evaluate_every
+        self.perplexity_tol = perplexity_tol
+        self.perplexity = []
+        self.perplexity_diff = self.perplexity_tol
+        self.perplexity_itr = []
 
         plpy.execute("DROP TABLE IF EXISTS " + self.work_table_0)
         plpy.execute("""
@@ -80,7 +86,9 @@ class LDATrainer:
                 topic_num   INT4,
                 alpha       FLOAT8,
                 beta        FLOAT8,
-                model       INT8[]
+                model       INT8[],
+                perplexity  DOUBLE PRECISION[],
+                perplexity_itr INTEGER[]
                 )
                 m4_ifdef(`__POSTGRESQL__', `',
                     `WITH (APPENDONLY=TRUE)
@@ -135,20 +143,20 @@ class LDATrainer:
         # iteration to sycn up output table and model table
         self.update_model_table(work_table_final)
 
-        # Update output table
-        plpy.execute("TRUNCATE TABLE " + self.output_data_table)
-        plpy.execute("""
-            INSERT INTO {output_data_table}
-            SELECT
-                docid, wordcount, words, counts, doc_topic[1:{topic_num}] topic_count,
-                doc_topic[{topic_num} + 1:array_upper(doc_topic,1)] topic_assignment
-            FROM
-                {work_table_final}
-            """.format(output_data_table=self.output_data_table,
-                       topic_num=self.topic_num,
-                       work_table_final=work_table_final))
-        # etime = time.time()
-        # plpy.notice('\t\t\ttime elapsed: %.2f seconds' % (etime - stime))
+        self.gen_output_data_table(work_table_final)
+
+        # JIRA: MADLIB-1351
+        # Calculate Perplexity after the final update of
+        # the Model and Output Table
+        if self.evaluate_every > 0:
+            self.perplexity.append(
+                get_perplexity('madlib',
+                               self.model_table,
+                               self.output_data_table))
+            # Need to update Model Table one more time to update
+            # last calculated value of perplexity to it
+            self.update_model_table(work_table_final)
+
 
     def iteration(self, it):
         # stime = time.time()
@@ -191,7 +199,32 @@ class LDATrainer:
         # etime = time.time()
         # plpy.notice('\t\ttime elapsed: %.2f seconds' % (etime - stime))
 
+        # JIRA: MADLIB-1351
+        # Calculate Perplexity for evaluate_every Iteration
+        # Skil the calculation at the first iteration as the model generated
+        # at first iteration is a random model
+        if it > self.evaluate_every and self.evaluate_every > 0 and (
+                it - 1) % self.evaluate_every == 0:
+            self.gen_output_data_table(work_table_in)
+            perplexity = 0.0
+            perplexity = get_perplexity('madlib',
+                                        self.model_table,
+                                        self.output_data_table)
+            self.perplexity_diff = abs(self.perplexity[
+                len(self.perplexity) - 1] - perplexity) if len(self.perplexity) > 0 else self.perplexity
+            self.perplexity_itr.append(it - 1)
+            self.perplexity.append(perplexity)
+
     def update_model_table(self, work_table_in):
+
+        # JIRA: MADLIB-1351
+        # Create a string based on the value of self.perplexity
+        prep_string = ""
+        prep_itr_str = ""
+        if len(self.perplexity) > 0:
+            prep_string = ", " + py_list_to_sql_string(self.perplexity)
+            prep_itr_str = ", " + py_list_to_sql_string(self.perplexity_itr)
+
         plpy.execute('TRUNCATE TABLE ' + self.model_table)
         if version_wrapper.is_gp43():
             with OptimizerControl(True):
@@ -209,12 +242,15 @@ class LDATrainer:
                             {voc_size},
                             {topic_num}
                         ) AS model
+                        {prep_string} {prep_itr_str}
                     FROM {work_table_in}
                     """.format(model_table=self.model_table,
                                topic_num=self.topic_num,
                                voc_size=self.voc_size,
                                alpha=self.alpha,
                                beta=self.beta,
+                               prep_string=prep_string,
+                               prep_itr_str=prep_itr_str,
                                schema_madlib=self.schema_madlib,
                                work_table_in=work_table_in))
         else:
@@ -239,11 +275,14 @@ class LDATrainer:
                 INSERT INTO {model_table}
                 SELECT
                     {voc_size}, {topic_num}, {alpha}, {beta}, $1
+                    {prep_string} {prep_itr_str}
                 """.format(model_table=self.model_table,
                            topic_num=self.topic_num,
                            voc_size=self.voc_size,
                            alpha=self.alpha,
                            beta=self.beta,
+                           prep_string=prep_string,
+                           prep_itr_str=prep_itr_str,
                            schema_madlib=self.schema_madlib),
                 ['bigint[]'])
             plpy.execute(plan, [model])
@@ -255,14 +294,41 @@ class LDATrainer:
         self.init_random()
         # sstime = time.time()
         for it in range(1, self.iter_num + 1):
+            # JIRA: MADLIB-1351
+            # If the Perplexity_diff is less than the perplexity_tol,
+            # Stop the iteration
+            if self.perplexity_diff < self.perplexity_tol:
+                break
             self.iteration(it)
         # eetime = time.time()
         # plpy.notice('\t\titeration done, time elapsed: %.2f seconds' % (eetime - sstime))
+
+
+        # JIRA: MADLIB-1351
+        # Add the last iteration value to the array
+        if self.evaluate_every > 0:
+            self.perplexity_itr.append(self.iter_num)
 
         self.gen_final_data_tables()
 
         # etime = time.time()
         # plpy.notice('finished, time elapsed: %.2f seconds' % (etime - stime))
+
+    # Update output table
+    def gen_output_data_table(self, work_table_final):
+        plpy.execute("TRUNCATE TABLE " + self.output_data_table)
+        plpy.execute("""
+            INSERT INTO {output_data_table}
+            SELECT
+                docid, wordcount, words, counts, doc_topic[1:{topic_num}] topic_count,
+                doc_topic[{topic_num} + 1:array_upper(doc_topic,1)] topic_assignment
+            FROM
+                {work_table_final}
+            """.format(output_data_table=self.output_data_table,
+                       topic_num=self.topic_num,
+                       work_table_final=work_table_final))
+        # etime = time.time()
+        # plpy.notice('\t\t\ttime elapsed: %.2f seconds' % (etime - stime))    
 
 # ------------------------------------------------------------------------------
 
@@ -416,7 +482,7 @@ class LDAPredictor:
 
 
 def lda_train(schema_madlib, train_table, model_table, output_data_table, voc_size,
-              topic_num, iter_num, alpha, beta):
+              topic_num, iter_num, alpha, beta, evaluate_every, perplexity_tol):
     """
     @brief This function provides the entry for the LDA training process.
     @param schema_madlib        MDALib schema
@@ -445,6 +511,12 @@ def lda_train(schema_madlib, train_table, model_table, output_data_table, voc_si
             'invalid argument: positive real expected for alpha')
     _assert(beta is not None and beta > 0,
             'invalid argument: positive real expected for beta')
+    _assert(evaluate_every is not None and evaluate_every >= 0,
+            'invalid argument: evaluate_every should be positive integer')
+    _assert(evaluate_every <= iter_num,
+            'invalid argument: evaluate_every should not be greater than iter_num')
+    _assert(perplexity_tol is not None and perplexity_tol >= 1e-1,
+            'invalid argument: perplexity_tol should not be less than .1')            
 
     output_tbl_valid(model_table, 'LDA')
     output_tbl_valid(output_data_table, 'LDA')
@@ -460,7 +532,7 @@ def lda_train(schema_madlib, train_table, model_table, output_data_table, voc_si
     convt_table = _convert_data_table(schema_madlib, train_table)
     lt = LDATrainer(schema_madlib, convt_table, model_table,
                     output_data_table, voc_size, topic_num,
-                    iter_num, alpha, beta)
+                    iter_num, alpha, beta,evaluate_every, perplexity_tol)
 
     lt.run()
 
