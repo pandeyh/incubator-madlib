@@ -26,7 +26,7 @@
   <packaging>pom</packaging>
 
   <build>
-    <pluginManagement>
+    <pluginManagement >
       <plugins>
         <plugin>
           <groupId>org.apache.rat</groupId>
