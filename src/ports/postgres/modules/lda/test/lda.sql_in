@@ -288,3 +288,57 @@ CREATE OR REPLACE FUNCTION validate_lda_output() RETURNS integer AS $$
 $$ LANGUAGE plpgsql;
 
 select validate_lda_output();
+
+
+---------- TEST CASES FOR PERPLEXITY ----------
+
+drop table if exists lda_model, lda_output_data;
+SELECT lda_train(
+    'lda_training',
+    'lda_model',
+    'lda_output_data',
+    20, 5, 2, 10, 0.01, 2, .2);
+
+SELECT assert(perplexity_itr = '{2}', 'Number of Perplexity iterations are wrong') from lda_model; 
+
+
+drop table if exists lda_model, lda_output_data;
+SELECT lda_train(
+    'lda_training',
+    'lda_model',
+    'lda_output_data',
+    20, 5, 3, 10, 0.01, 1, .1);
+
+SELECT assert(cardinality(perplexity) = 3, 'Perplexity calculation is wrong') from lda_model; 
+
+-- Function to check if the perplexity value returned from the function 
+-- and calculated by the train funcion are same. 
+CREATE OR REPLACE FUNCTION validate_perplexity() RETURNS boolean AS $$
+
+    DECLARE
+        perplexity_from_func Double precision[];
+        perplexity_lda_train Double precision[];
+
+    BEGIN
+        drop table if exists lda_model, lda_output_data;
+        PERFORM lda_train(
+        'lda_training',
+        'lda_model',
+        'lda_output_data',
+        20, 5, 2, 10, 0.01, 2, .2);
+
+         SELECT array_agg(round(lda_get_perplexity::numeric,10))  INTO perplexity_from_func from lda_get_perplexity('lda_model','lda_output_data');
+
+          select perplexity INTO perplexity_lda_train from lda_model ;
+
+
+        if perplexity_lda_train != perplexity_from_func  THEN
+            return FALSE;
+        ELSE
+            return TRUE;
+        END IF;    
+
+    END;
+$$ LANGUAGE plpgsql;
+
+select assert(validate_perplexity() = TRUE, 'Perplexity calculation is wrong');
